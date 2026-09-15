@@ -2,7 +2,9 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -163,3 +165,125 @@ def apply_rotary_pos_emb(
         return (x.float() * c + rotated * s).to(x.dtype)
 
     return rotate(q), rotate(k)
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """将 [batch, seq, kv_heads, dim] 的每个 KV 头分配给 n_rep 个 Q 头。"""
+    return x if n_rep == 1 else x.repeat_interleave(n_rep, dim=2)
+
+
+class Attention(nn.Module):
+    """带 RoPE 的因果 GQA，输入和输出均为 [batch, seq, hidden_size]。"""
+
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.n_heads = config.num_attention_heads
+        self.n_kv_heads = config.num_key_value_heads
+        if self.n_heads <= 0 or self.n_kv_heads <= 0:
+            raise ValueError("Attention head counts must be positive")
+        if config.hidden_size % self.n_heads or self.n_heads % self.n_kv_heads:
+            raise ValueError("hidden_size must divide evenly into Q heads, and Q heads into KV groups")
+        self.head_dim = config.hidden_size // self.n_heads
+        if self.head_dim <= 0 or self.head_dim % 2:
+            raise ValueError("RoPE requires a positive even head_dim")
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.flash = config.flash_attention
+        self.dropout = config.dropout
+        self.q_proj = nn.Linear(config.hidden_size, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, config.hidden_size, bias=False)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """position_embeddings 传完整 cos/sin 表，本层按缓存长度自动切片。
+
+        缓存为未重复的 (旋转后 K, V)，形状 [batch, past_seq, kv_heads, dim]。
+        attention_mask 可选，形状 [batch, past_seq + seq]，1/True 表示有效 key。
+        返回 (输出, 新缓存或 None)。批内共享位置编号，不单独压缩 padding 位置。
+        """
+        batch, seq_len, _ = x.shape
+        q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(batch, seq_len, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(batch, seq_len, self.n_kv_heads, self.head_dim)
+        past_len = 0
+        if past_key_value is not None:
+            pk, pv = past_key_value
+            if (pk.ndim != 4 or pk.shape != pv.shape or pk.shape[0] != batch
+                    or pk.shape[2:] != (self.n_kv_heads, self.head_dim)):
+                raise ValueError("Invalid KV cache shape")
+            past_len = pk.shape[1]
+
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(
+            q, k, cos[past_len:past_len + seq_len], sin[past_len:past_len + seq_len]
+        )
+        if past_key_value is not None:
+            k = torch.cat((pk, k), dim=1)
+            v = torch.cat((pv, v), dim=1)
+        present = (k, v) if use_cache else None
+
+        q = q.transpose(1, 2)
+        k = repeat_kv(k, self.n_rep).transpose(1, 2)
+        v = repeat_kv(v, self.n_rep).transpose(1, 2)
+        total_len = past_len + seq_len
+        # 缓存解码时 query 的绝对位置从 past_len 开始。
+        allowed = None
+        if past_len or attention_mask is not None or not self.flash:
+            queries = torch.arange(seq_len, device=x.device) + past_len
+            keys = torch.arange(total_len, device=x.device)
+            allowed = (keys[None, :] <= queries[:, None])[None, None, :, :]
+            if attention_mask is not None:
+                if attention_mask.shape != (batch, total_len):
+                    raise ValueError("attention_mask must cover both cached and current tokens")
+                allowed = allowed & attention_mask.to(device=x.device, dtype=torch.bool)[:, None, None, :]
+
+        if self.flash:
+            # PyTorch 根据设备选择可用后端，不保证一定使用 FlashAttention 内核。
+            output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=allowed,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=allowed is None,
+            )
+        else:
+            scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores.masked_fill(~allowed, float("-inf"))
+            # 全被遮挡的 padding 行输出零，避免 softmax(-inf) 产生 NaN。
+            has_keys = allowed.any(dim=-1, keepdim=True)
+            scores = scores.masked_fill(~has_keys, 0.0)
+            probs = scores.softmax(dim=-1).masked_fill(~has_keys, 0.0).to(v.dtype)
+            output = F.dropout(probs, p=self.dropout, training=self.training) @ v
+
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.resid_dropout(self.o_proj(output)), present
+
+
+class FeedForward(nn.Module):
+    """门控前馈网络；hidden_act='silu' 时为 SwiGLU。"""
+
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            # 三个投影采用约 8/3 倍宽度，并向上对齐到 64 的倍数。
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 63) // 64)
+        if config.intermediate_size <= 0:
+            raise ValueError("intermediate_size must be positive")
+
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[batch, seq, hidden] -> [batch, seq, hidden]，分别处理每个 token。"""
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
