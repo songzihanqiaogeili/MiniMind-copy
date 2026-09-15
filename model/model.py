@@ -1,3 +1,7 @@
+import math
+
+import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 
@@ -81,3 +85,81 @@ class RMSNorm(nn.Module):
         return  torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight * x * self._norm(x)
+
+
+def precompute_freqs_cis(
+    dim: int,
+    end: int = 32 * 1024,
+    rope_base: float = 1000000.0,
+    rope_scaling: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """预计算 RoPE 的 cos/sin 表，形状均为 [end, dim]。
+
+    dim 是每个注意力头的维度。采用前后半维配对的旋转布局；
+    rope_scaling=None 使用普通 RoPE，否则按 YaRN 调整频率。
+    """
+    if dim <= 0 or dim % 2:
+        raise ValueError("dim must be a positive even integer")
+    if end <= 0 or rope_base <= 1:
+        raise ValueError("end must be positive and rope_base must exceed 1")
+
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+    attention_factor = 1.0
+
+    if rope_scaling is not None:
+        if rope_scaling.get("rope_type", rope_scaling.get("type", "yarn")) != "yarn":
+            raise ValueError("Only yarn rope scaling is supported")
+        factor = float(rope_scaling.get("factor", 1.0))
+        original_length = int(rope_scaling["original_max_position_embeddings"])
+        beta_fast = float(rope_scaling.get("beta_fast", 32))
+        beta_slow = float(rope_scaling.get("beta_slow", 1))
+        if factor < 1 or original_length <= 0 or not 0 < beta_slow < beta_fast:
+            raise ValueError("Invalid YaRN factor, original length or beta range")
+
+        def correction_dim(rotations: float) -> float:
+            return dim * math.log(original_length / (2 * math.pi * rotations)) / (
+                2 * math.log(rope_base)
+            )
+
+        low = max(math.floor(correction_dim(beta_fast)), 0)
+        high = min(math.ceil(correction_dim(beta_slow)), dim - 1)
+        if low == high:
+            high += 0.001
+        ramp = ((torch.arange(dim // 2).float() - low) / (high - low)).clamp(0, 1)
+        # 高频保留原频率，低频除以扩展倍数，中频平滑过渡。
+        freqs = freqs * (1 - ramp) + (freqs / factor) * ramp
+        attention_factor = rope_scaling.get("attention_factor")
+        if attention_factor is None:
+            attention_factor = 1.0 + 0.1 * math.log(factor)
+
+    angles = torch.outer(torch.arange(end).float(), freqs)
+    angles = torch.cat((angles, angles), dim=-1)
+    return angles.cos() * attention_factor, angles.sin() * attention_factor
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """旋转 Q/K：[batch, seq_len, heads, head_dim]，允许 Q/K 头数不同。
+
+    cos/sin 为当前序列位置对应的 [seq_len, head_dim] 切片。
+    KV cache 解码时，调用方需按历史长度切片，例如 cos[start:start+seq_len]。
+    """
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError("q and k must have shape [batch, seq_len, heads, head_dim]")
+    if q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1] or q.shape[-1] % 2:
+        raise ValueError("q and k must share batch, sequence and even head dimensions")
+    if cos.shape != (q.shape[1], q.shape[-1]) or sin.shape != cos.shape:
+        raise ValueError("cos and sin must have shape [seq_len, head_dim]")
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        first, second = x.float().chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        c = cos.to(device=x.device, dtype=torch.float32)[None, :, None, :]
+        s = sin.to(device=x.device, dtype=torch.float32)[None, :, None, :]
+        return (x.float() * c + rotated * s).to(x.dtype)
+
+    return rotate(q), rotate(k)
