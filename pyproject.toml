@@ -1,0 +1,22 @@
+[project]
+name = "minimind"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Zihan Song", email = "502285530@qq.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3.4",
+    "pandas>=2.3.3",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
+]
+
+[project.scripts]
+minimind = "minimind:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
