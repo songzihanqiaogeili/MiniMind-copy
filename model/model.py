@@ -325,3 +325,90 @@ class MiniMindBlock(nn.Module):
         hidden_states = residual + hidden_states
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
+
+
+class MiniMindModel(nn.Module):
+    """Embedding、多个 Transformer Block 和最终 RMSNorm，不包含词表输出层。"""
+
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        if config.num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers must be positive")
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList(
+            [MiniMindBlock(layer_id, config) for layer_id in range(self.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        cos, sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.register_buffer("freqs_cos", cos, persistent=False)
+        self.register_buffer("freqs_sin", sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: list | tuple | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, list, torch.Tensor]:
+        """返回 (hidden_states, 每层缓存列表, aux_loss)。
+
+        input_ids: [batch, 当前序列长度]；mask 覆盖历史和当前全部 key。
+        缓存仅支持每层 (K, V) 的列表/元组；不支持框架 Cache 对象。
+        无缓存输出时列表内为 None；当前普通 FFN 的 aux_loss 为零。
+        """
+        if input_ids is None or input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must have shape [batch, nonempty seq]")
+        if past_key_values is None:
+            past_key_values = [None] * self.num_hidden_layers
+        elif not isinstance(past_key_values, (list, tuple)):
+            raise TypeError("past_key_values must be a list/tuple of per-layer (K, V) caches")
+        if len(past_key_values) != self.num_hidden_layers:
+            raise ValueError("past_key_values must contain exactly one entry per layer")
+
+        lengths = []
+        for past in past_key_values:
+            if past is None:
+                lengths.append(0)
+                continue
+            if not isinstance(past, (list, tuple)) or len(past) != 2:
+                raise ValueError("Each layer cache must be a (K, V) pair")
+            k, v = past
+            expected_tail = (self.config.num_key_value_heads, self.layers[0].head_dim)
+            if (not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor)
+                    or k.ndim != 4 or k.shape != v.shape
+                    or k.shape[0] != input_ids.shape[0] or k.shape[2:] != expected_tail):
+                raise ValueError("Invalid layer cache shape")
+            lengths.append(k.shape[1])
+        if len(set(lengths)) != 1:
+            raise ValueError("All layer caches must have the same sequence length")
+        total_length = lengths[0] + input_ids.shape[1]
+        if total_length > self.freqs_cos.shape[0]:
+            raise ValueError("Sequence including cache exceeds max_position_embeddings")
+        if attention_mask is not None and attention_mask.shape != (input_ids.shape[0], total_length):
+            raise ValueError("attention_mask must cover cached and current tokens")
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # Attention 内部按缓存长度切片，这里必须传完整位置表。
+        position_embeddings = (self.freqs_cos, self.freqs_sin)
+        presents = []
+        for layer, past in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+        hidden_states = self.norm(hidden_states)
+        aux_loss = hidden_states.new_zeros(())
+        return hidden_states, presents, aux_loss
