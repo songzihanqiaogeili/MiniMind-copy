@@ -3,7 +3,9 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
+from transformers.cache_utils import DynamicCache
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.activations import ACT2FN
 
 
@@ -412,3 +414,123 @@ class MiniMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         aux_loss = hidden_states.new_zeros(())
         return hidden_states, presents, aux_loss
+
+
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """在骨干模型上加入共享权重的词表投影和 next-token loss。"""
+
+    config_class = MokioMindConfig
+    base_model_prefix = "model"
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self, config: MokioMindConfig):
+        config.tie_word_embeddings = True
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, MiniMindModel):
+            # from_pretrained 的 meta 初始化后需重建非持久化 buffer。
+            cos, sin = precompute_freqs_cis(
+                dim=self.config.hidden_size // self.config.num_attention_heads,
+                end=self.config.max_position_embeddings,
+                rope_base=self.config.rope_theta,
+                rope_scaling=self.config.rope_scaling,
+            )
+            module.freqs_cos = cos.to(module.freqs_cos.device)
+            module.freqs_sin = sin.to(module.freqs_sin.device)
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, value):
+        self.lm_head = value
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, use_cache=True, **kwargs
+    ):
+        past_len = 0
+        if isinstance(past_key_values, DynamicCache):
+            past_len = past_key_values.get_seq_length()
+        elif past_key_values:
+            past_len = past_key_values[0][0].shape[1]
+        if past_len:
+            input_ids = input_ids[:, past_len:]
+        return dict(
+            input_ids=input_ids, attention_mask=attention_mask,
+            past_key_values=past_key_values, use_cache=use_cache, logits_to_keep=1,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        past_key_values=None,
+        use_cache: bool = False,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs,
+    ):
+        # Transformers 的 DynamicCache 使用 [batch, heads, seq, dim] 布局。
+        dynamic_cache = past_key_values if isinstance(past_key_values, DynamicCache) else None
+        past_len = dynamic_cache.get_seq_length() if dynamic_cache is not None else 0
+        legacy_cache = past_key_values
+        if dynamic_cache is not None:
+            legacy_cache = None if past_len == 0 else [
+                (layer.keys.transpose(1, 2), layer.values.transpose(1, 2))
+                for layer in dynamic_cache.layers
+            ]
+        hidden_states, presents, aux_loss = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            past_key_values=legacy_cache, use_cache=use_cache,
+        )
+        if isinstance(logits_to_keep, int):
+            if logits_to_keep < 0:
+                raise ValueError("logits_to_keep must be nonnegative")
+            indices = slice(-logits_to_keep, None)
+        else:
+            indices = logits_to_keep
+
+        loss = None
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError("labels must match input_ids shape")
+            # loss 始终使用完整当前序列，避免 logits 截断后与 labels 错位。
+            full_logits = self.lm_head(hidden_states)
+            targets = labels[:, 1:].to(full_logits.device)
+            shifted = full_logits[:, :-1].float()
+            if targets.numel() and (targets != -100).any():
+                loss = F.cross_entropy(
+                    shifted.reshape(-1, self.config.vocab_size), targets.reshape(-1), ignore_index=-100
+                )
+            else:
+                loss = full_logits.sum() * 0.0
+            logits = full_logits[:, indices, :]
+        else:
+            logits = self.lm_head(hidden_states[:, indices, :])
+
+        output_cache = None
+        if use_cache:
+            if dynamic_cache is None:
+                dynamic_cache = DynamicCache(config=self.config)
+                past_len = 0
+            for layer_idx, (k, v) in enumerate(presents):
+                dynamic_cache.update(
+                    k[:, past_len:].transpose(1, 2), v[:, past_len:].transpose(1, 2), layer_idx
+                )
+            output_cache = dynamic_cache
+        output = CausalLMOutputWithPast(
+            loss=loss, logits=logits, past_key_values=output_cache,
+            hidden_states=(hidden_states,),
+        )
+        output["aux_loss"] = aux_loss
+        return output
