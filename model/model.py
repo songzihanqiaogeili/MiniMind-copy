@@ -287,3 +287,41 @@ class FeedForward(nn.Module):
         """[batch, seq, hidden] -> [batch, seq, hidden]，分别处理每个 token。"""
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
+
+
+class MiniMindBlock(nn.Module):
+    """Pre-norm Transformer 层，Attention 和 FFN 各带一条残差连接。"""
+
+    def __init__(self, layer_id: int, config: MokioMindConfig):
+        super().__init__()
+        if config.use_moe:
+            raise NotImplementedError("MOEFeedForward is not implemented; use use_moe=False")
+        self.layer_id = layer_id
+        self.self_attn = Attention(config)
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.self_attn.head_dim
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """传入完整 cos/sin 表及本层缓存；输出形状保持 [batch, seq, hidden]。"""
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
